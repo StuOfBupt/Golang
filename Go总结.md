@@ -252,7 +252,7 @@ encoding/json包对 json 格式的数据编码、解码有良好的支持
 
 ## Goroutines 和 Channels
 
-#### Goroutines
+### Goroutines
 
 在Go语言中，每一个并发的执行单元叫作一个goroutine（协程）
 
@@ -293,7 +293,203 @@ encoding/json包对 json 格式的数据编码、解码有良好的支持
 - 向缓存Channel的发送操作就是向内部缓存队列的尾部插入元素，接收操作则是从队列的头部删除元素。如果内部缓存队列是满的，那么发送操作将阻塞直到因另一个goroutine执行接收操作而释放了新的队列空间。相反，如果channel是空的，接收操作将阻塞直到有另一个goroutine执行发送操作而向队列插入元素
 - cap 可以获取 channel 的容量，len 可以获取当前 channel 的有效元素个数
 
+#### channel 泄露
 
+```go
+func main() {
+    abort := make(chan struct{})
+		go func() {
+    		os.Stdin.Read(make([]byte, 1)) // read a single byte
+    		abort <- struct{}{}
+		}()
+  
+    fmt.Println("Commencing countdown.  Press return to abort.")
+    tick := time.Tick(1 * time.Second)
+    for countdown := 10; countdown > 0; countdown-- {
+        fmt.Println(countdown)
+        select {
+        case <-tick:
+            // Do nothing.
+        case <-abort:
+            fmt.Println("Launch aborted!")
+            return
+        }
+    }
+    launch()
+}
+```
 
+time.Tick函数表现得好像它创建了一个在循环中调用time.Sleep的goroutine，每次被唤醒时发送一个事件。当countdown函数返回时，select会停止从tick中接收事件，但是ticker这个goroutine还依然存活，继续徒劳地尝试向channel中发送值，然而这时候已经没有其它的goroutine会从该channel中接收值了——这被称为goroutine泄露.
 
+```go
+ticker.Stop() // cause the ticker's goroutine to terminate
+```
+
+## Select 多路复用
+
+```go
+select {
+case <-ch1:
+    // ...
+case x := <-ch2:
+    // ...use x...
+case ch3 <- y:
+    // ...
+default:
+    // ...
+}
+```
+
+- 每一个case代表一个通信操作（在某个channel上进行发送或者接收），并且会包含一些语句组成的一个语句块。
+- 多个case同时就绪时，select会随机地选择一个执行，这样来保证每一个channel都有平等的被select的机会
+- 有时候我们希望能够从channel中发送或者接收值，并避免因为发送或者接收导致的阻塞，尤其是当channel没有准备好写或者读时。使用`default`来设置当其它的操作都不能够马上被处理时程序需要执行哪些逻辑。
+
+## 基于共享变量的并发
+
+### sync.Mutex
+
+#### 通过容量为 1 的 channel 实现互斥锁
+
+通过使用容量为 n 的buffered channel作为一个计数信号量，来保证最多只有n个goroutine会同时执行。同理，可以用一个容量只有1的channel来保证最多只有一个goroutine在同一时刻访问一个共享变量:
+
+```go
+var (
+    sema    = make(chan struct{}, 1) // a binary semaphore guarding balance
+    balance int
+)
+
+func Deposit(amount int) {
+    sema <- struct{}{} // acquire token
+    balance = balance + amount
+    <-sema // release token
+}
+
+func Balance() int {
+    sema <- struct{}{} // acquire token
+    b := balance
+    <-sema // release token
+    return b
+}
+```
+
+#### mutex
+
+```go
+import "sync"
+
+var (
+    mu      sync.Mutex // guards balance
+    balance int
+)
+
+func Deposit(amount int) {
+    mu.Lock()
+    balance = balance + amount
+    mu.Unlock()
+}
+
+func Balance() int {
+    mu.Lock()
+    b := balance
+    mu.Unlock()
+    return b
+}
+```
+
+#### 不可重入
+
+```go
+// NOTE: incorrect!
+func Withdraw(amount int) bool {
+    mu.Lock()	// 申请锁
+    defer mu.Unlock()
+    Deposit(-amount)
+    if Balance() < 0 {
+        Deposit(amount)	// Deposit 再次申请锁
+        return false // insufficient funds
+    }
+    return true
+}
+```
+
+上面例子中，Deposit会调用mu.Lock()第二次去获取互斥锁，但因为mutex已经锁上了，而无法被重入（go里没有重入锁）——也就是说没法对一个已经锁上的mutex来再次上锁——这会导致程序死锁，没法继续执行下去，Withdraw会永远阻塞下去。
+
+> 关于Go的mutex不能重入这一点有很充分的理由：mutex的目的是**确保共享变量在程序执行时的关键点上能够保证不变性**。
+>
+> 不变性的一层含义是“没有goroutine访问共享变量”，但实际上这里对于mutex保护的变量来说，不变性还包含更深层含义：当一个goroutine获得了一个互斥锁时，它能断定被互斥锁保护的变量正处于不变状态（即没有其他代码块正在读写共享变量），在其获取并保持锁期间，可能会去更新共享变量，这样不变性只是短暂地被破坏，然而当其释放锁之后，锁必须保证共享变量重获不变性并且多个goroutine按顺序访问共享变量。**尽管一个可以重入的mutex也可以保证没有其它的goroutine在访问共享变量，但它不具备不变性更深层含义**
+
+一个通用的解决方案是将一个函数分离为多个函数，比如把Deposit分离成两个：一个不导出的函数deposit，这个函数假设锁总是会被保持并去做实际的操作（不用申请锁），另一个是导出的函数Deposit，这个函数会调用deposit，但在调用前会先去获取锁
+
+### sync.RWMutex
+
+由于Balance函数只需要读取变量的状态，所以同时让多个Balance调用并发运行事实上是安全的，只要在运行的时候没有存款或者取款操作就行。在这种场景下需要一种特殊类型的锁，其允许多个只读操作并行执行，但写操作会完全互斥。Go语言提供的这样的锁是sync.RWMutex
+
+```go
+var mu sync.RWMutex
+var balance int
+func Balance() int {
+    mu.RLock() // readers lock
+    defer mu.RUnlock()
+    return balance
+}
+```
+
+### sync.Once 惰性初始化
+
+```go
+var icons map[string]image.Image
+
+func loadIcons() {
+    icons = map[string]image.Image{
+        "spades.png":   loadIcon("spades.png"),
+        "hearts.png":   loadIcon("hearts.png"),
+        "diamonds.png": loadIcon("diamonds.png"),
+        "clubs.png":    loadIcon("clubs.png"),
+    }
+}
+```
+
+一个goroutine在检查icons是非空时，并不能就假设这个变量的初始化流程已经走完了
+
+通过引入读写锁来实现在并发条件下对变量进行惰性加载：
+
+```go
+var mu sync.RWMutex // guards icons
+var icons map[string]image.Image
+// Concurrency-safe.
+func Icon(name string) image.Image {
+    mu.RLock()
+    if icons != nil {
+        icon := icons[name]
+        mu.RUnlock()
+        return icon
+    }
+    mu.RUnlock()
+
+    // acquire an exclusive lock
+    mu.Lock()
+    if icons == nil { // NOTE: must recheck for nil
+        loadIcons()
+    }
+    icon := icons[name]
+    mu.Unlock()
+    return icon
+}
+```
+
+​		上面的模板能够更好的并发，但是有一点太复杂且容易出错。sync包提供了一个专门的方案来解决这种一次性初始化的问题：`sync.Once`。
+
+​		概念上来讲，一次性的初始化需要一个互斥量mutex和一个boolean变量来记录初始化是不是已经完成了；互斥量用来保护boolean变量和客户端数据结构。Do这个唯一的方法需要接收初始化函数作为其参数。
+
+```go
+var loadIconsOnce sync.Once
+var icons map[string]image.Image
+// Concurrency-safe.
+func Icon(name string) image.Image {
+    loadIconsOnce.Do(loadIcons)
+    return icons[name]
+}
+```
+
+每一次对Do(loadIcons)的调用都会锁定mutex，并会检查boolean变量。在第一次调用时，boolean变量的值是false，Do会调用loadIcons并会将boolean变量设置为true。随后的调用什么都不会做，但是mutex同步会保证loadIcons对内存（就是指icons变量）产生的效果能够对所有goroutine可见。用这种方式来使用sync.Once的话，能够避免在变量被构建完成之前和其它goroutine共享该变量。
 
